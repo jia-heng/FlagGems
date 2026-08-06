@@ -69,14 +69,18 @@ def test_accuracy_vectornorm(shape, ord, dim, keepdim, dtype):
     with flag_gems.use_gems():
         res_out = torch.linalg.vector_norm(inp, ord, dim, keepdim)
 
-    # On mthreads with --ref cpu (TO_CPU=True), the reference is computed on CPU.
-    # For large reduce_dim (e.g. 8M elements with ord=1), torch GPU (mthreads native)
-    # and FlagGems Triton kernel produce consistent results, but both diverge from
-    # torch CPU due to float32 accumulation precision differences between CPU and
-    # GPU implementations. This is not a Triton kernel correctness issue.
-    # Relax atol from default 1e-4 to 5e-3 only in this scenario.
-    atol = 5e-3 if (flag_gems.vendor_name == "mthreads" and cfg.TO_CPU) else 1e-4
+    # When the reference is computed on CPU (--ref cpu / TO_CPU=True), large
+    # reductions in float32 with ord=1 cause GPU and CPU results to diverge due to
+    # accumulation order differences (parallel block reduction vs sequential/pairwise).
+    # Both native torch GPU and FlagGems Triton produce consistent results that differ
+    # from torch CPU — this is not a kernel correctness issue.
+    # Relax atol from default 1e-4 to 5e-3 for large reductions with ord=1.
+    reduce_dim = _get_reduce_dim(shape, dim)
+    if cfg.TO_CPU and ord == 1 and reduce_dim > 1e6 and dtype == torch.float32:
+        atol = 5e-3
+    else:
+        atol = 1e-4
 
     utils.gems_assert_close(
-        res_out, ref_out, dtype, reduce_dim=_get_reduce_dim(shape, dim), atol=atol
+        res_out, ref_out, dtype, reduce_dim=reduce_dim, atol=atol
     )
