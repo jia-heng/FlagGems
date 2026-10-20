@@ -22,6 +22,7 @@ from .fused_moe import (
     invoke_fused_moe_triton_kernel,
     outplace_fused_experts,
 )
+from .mhc_post import mhc_post
 from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
 from .moe_sum import moe_sum
 from .rotary_embedding import apply_rotary_pos_emb
@@ -35,6 +36,7 @@ __all__ = [
     "fused_add_rms_norm",
     "skip_layer_norm",
     "sparse_attn_triton",
+    "mhc_post",
     "moe_align_block_size",
     "moe_align_block_size_triton",
     "moe_sum",
