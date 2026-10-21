@@ -74,6 +74,7 @@ cap falls back to the generic implementation in ``flag_gems.fused.mhc``.
 
 import functools
 import logging
+import math
 import os
 
 import torch
@@ -181,8 +182,37 @@ def _rows_ub_bytes(block_d: int, elem_bytes: int) -> int:
 
 
 _MAX_BLOCK_T = 4
+
+# Programs per vector core the batched kernel wants. **Measured, and it
+# overturned the earlier rule.** Sweeping BLOCK_T x PIPE over 8 shapes x 2
+# dtypes, the winning configuration had a grid of exactly 512 in 13 of the 16
+# cases and 512 was in the top three of the rest -- independent of D, of T, and
+# of which (BLOCK_T, PIPE) pair produced it. 512 / 40 cores = 12.8, so what
+# matters is programs *per core*, not merely covering the cores.
+#
+# The earlier rule minimized the grid subject to covering the cores, which kept
+# selecting BLOCK_T=4 and lost 1.5-20% by shape. It read PIPE as peaking at 4,
+# but that sweep held BLOCK_T at 4, where PIPE=4 at T=8192 *is* a grid of 512 --
+# the apparent turn was the grid passing through its optimum. BLOCK_T=1 was
+# never tried, having been counted as "not batching", though BLOCK_T=1 with
+# PIPE>1 is a real batched launch: one token per DMA group, several groups
+# pipelined per program.
+#
+# Expressed per core so it tracks the 48-core 910_93xx parts without retuning.
+_TARGET_GRID_PER_CORE = 13
 # coreDim cap on the launch grid.
 _MAX_GRID = 65535
+
+
+def _cdiv(a: int, b: int) -> int:
+    """Integer ceiling division.
+
+    Not ``triton.cdiv``: that costs ~4.9 us per call (measured), and the
+    dispatch path below makes several per launch on an operator whose whole
+    device time is ~0.3 ms. Using it here cost 40% end to end in the sibling
+    research repo before being caught.
+    """
+    return -(-a // b)
 
 
 @functools.lru_cache(maxsize=4)
@@ -261,6 +291,9 @@ def _choose_block_d(D: int) -> int:
     return max(_MIN_BLOCK_D if D >= _MIN_BLOCK_D else D, min(block, cap))
 
 
+@functools.lru_cache(maxsize=256)  # pure in its args and on the dispatch
+# path; the search costs ~26 us uncached against 0.28 us cached, and this
+# operator is dispatch-bound enough for that to matter.
 def _choose_batch_t(D: int, T: int, elem_bytes: int = 2):
     """Pick ``(BLOCK_T, PIPE)`` for the batched kernel, or ``(0, 0)`` to decline.
 
@@ -290,19 +323,43 @@ def _choose_batch_t(D: int, T: int, elem_bytes: int = 2):
     scale = elem_bytes / 2
     fixed = int(_UB_BT_FIXED_PER_D * D)
     per_tok = max(1, int(_UB_BT_PER_ELEM * scale * D))
-    block_t = (_UB_BT_BUDGET_BYTES - fixed) // per_tok
-    block_t = min(block_t, T, _MAX_BLOCK_T)
-    if block_t < 2:
+    ub_cap = (_UB_BT_BUDGET_BYTES - fixed) // per_tok
+    if min(ub_cap, T) < 2:
         return 0, 0
-    # Largest power of two that fits: the inner loop is fully unrolled, so a
-    # non-power-of-two BLOCK_T only adds code without reducing DMA count.
-    block_t = 1 << (block_t.bit_length() - 1)
-    # Keep enough groups to fill the vector cores before growing PIPE.
+
     cores = _num_vector_cores()
-    pipe = 1
-    while pipe < _MAX_PIPE and T // (block_t * pipe * 2) >= cores:
-        pipe *= 2
-    return block_t, pipe
+    target = _TARGET_GRID_PER_CORE * cores
+
+    best = None
+    for block_t in (1, 2, 4):
+        if block_t > min(ub_cap, T, _MAX_BLOCK_T):
+            continue
+        groups = _cdiv(T, block_t)
+        for pipe in (1, 2, 4, 8, 16):
+            # PIPE past the group count only adds iterations the tail guard
+            # skips, while shrinking the grid below what the cores can use.
+            if pipe > groups:
+                continue
+            grid = max(1, _cdiv(groups, pipe))
+            if grid > _MAX_GRID:
+                continue
+            # (1, 1) is the (T,) grid under another name -- no batching at all.
+            # Excluding it also stops the ranking collapsing onto it at small
+            # T, where every reachable grid is under target and "closest"
+            # would otherwise mean "smallest".
+            if block_t == 1 and pipe == 1:
+                continue
+            # Distance from the target grid in log space, so 2x under is
+            # penalized like 2x over; ties go to the smaller BLOCK_T, which
+            # measured better at equal grid (fewer unrolled token loops).
+            err = abs(math.log2(grid / target))
+            key = (round(err, 6), block_t, -pipe)
+            if best is None or key < best[0]:
+                best = (key, block_t, pipe)
+
+    if best is None:
+        return 0, 0
+    return best[1], best[2]
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +442,7 @@ def _prune_batch_t(configs, nargs, **kwargs):
         # Unlike the closed-form rule, which always batches at least 2 tokens,
         # autotune would otherwise be free to pick BLOCK_T=PIPE=1 and launch T
         # programs -- a hard runtime failure above 65535 tokens.
-        if t is not None and triton.cdiv(triton.cdiv(t, bt), pipe) > _MAX_GRID:
+        if t is not None and _cdiv(_cdiv(t, bt), pipe) > _MAX_GRID:
             continue
         kept.append(cfg)
     # Never return empty: the rule's own choice fits UB and the grid cap by
@@ -815,15 +872,20 @@ def mhc_post(
     cores = _num_vector_cores()
     block_t, pipe = _choose_batch_t(h, n, residual.element_size())
 
-    if block_t >= 2:
+    # BLOCK_T=1 with PIPE>1 is a valid batched launch (one token per DMA group,
+    # several groups pipelined per program) and is in fact what the rule now
+    # picks most of the time, so the test is on the product, not on BLOCK_T
+    # alone. Testing block_t >= 2 here silently sent every small-H shape to the
+    # unbatched kernel.
+    if block_t >= 1 and pipe >= 1 and block_t * pipe >= 2:
         # Small-H regime: batch tokens. BLOCK_T and PIPE come from autotune, so
         # the grid is a callable over the chosen meta-parameters. It divides by
         # BLOCK_T*PIPE, which clears the coreDim cap on its own.
         out = torch.empty_like(xf)
 
         def grid_batched(meta):
-            groups = triton.cdiv(n, meta["BLOCK_T"])
-            return (max(1, triton.cdiv(groups, meta["PIPE"])),)
+            groups = _cdiv(n, meta["BLOCK_T"])
+            return (max(1, _cdiv(groups, meta["PIPE"])),)
 
         if n < _MIN_T_FOR_AUTOTUNE:
             # Too small to time; use the rule and bypass the autotuner.
@@ -855,9 +917,9 @@ def mhc_post(
         bt, p = tiling
         # A memo hit is keyed on a T *bucket*, so the actual T can be up to 2x
         # the one that was tuned; re-check the cap rather than trust the memo.
-        if triton.cdiv(triton.cdiv(n, bt), p) > _MAX_GRID:
+        if _cdiv(_cdiv(n, bt), p) > _MAX_GRID:
             bt, p = block_t, pipe
-        grid = (max(1, triton.cdiv(triton.cdiv(n, bt), p)),)
+        grid = (max(1, _cdiv(_cdiv(n, bt), p)),)
         _kernel_batch_t.fn[grid](
             xf,
             hres,
